@@ -106,11 +106,22 @@ func (m *Module) parse(thread *starlark.Thread, b *starlark.Builtin, args starla
 	if err := starlark.UnpackArgs(b.Name(), args, kwargs, "source", &source); err != nil {
 		return none, err
 	}
-	tmpl, perr := m.newEngine().ParseString(source.GoString())
+	tmpl, perr := parseString(m.newEngine(), source.GoString())
 	if perr != nil {
 		return none, fmt.Errorf("liquid.parse: %w", perr)
 	}
 	return &templateValue{tmpl: tmpl, maxOutput: m.maxOutput()}, nil
+}
+
+// parseString compiles a template, recovering panics into errors (matching the
+// render paths so malformed input can never crash the host).
+func parseString(engine *liquid.Engine, source string) (tmpl *liquid.Template, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			tmpl, err = nil, fmt.Errorf("liquid: parse panic: %v", r)
+		}
+	}()
+	return engine.ParseString(source)
 }
 
 // parseRenderArgs extracts the source and the bindings map from a render call,
