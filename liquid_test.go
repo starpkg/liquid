@@ -4,7 +4,7 @@ package liquid
 //
 // Sections:
 //   - rendering via the Starlark API (render / parse, dict + kwargs bindings)
-//   - safety: include disabled, output cap, strict mode
+//   - safety: include disabled, output cap, strict mode, malformed-input hardening
 //   - config options end-to-end (strict / max_output_size via the module path)
 //   - templateValue surface (type/str repr, unhashable as a dict key)
 
@@ -150,6 +150,51 @@ func TestCollectBindings(t *testing.T) {
 	}
 	if got, ok := b["k"]; !ok || fmt.Sprintf("%v", got) != "7" {
 		t.Errorf("bindings[k] = %v, want 7", got)
+	}
+}
+
+// TestMalformedTemplateNoPanic feeds syntax-error templates to BOTH render()
+// and parse(): each must return a clean error rather than panic. parse() routes
+// its ParseString through a defer/recover (parseString), matching the render
+// paths, so a panicking parse degrades to an error instead of crashing the host.
+func TestMalformedTemplateNoPanic(t *testing.T) {
+	malformed := []string{
+		`{% if %}`,          // unterminated if block
+		`{% for %}`,         // unterminated for block
+		`{{ x | }}`,         // dangling filter pipe
+		`{% endfor %}`,      // stray end tag
+		`{% unknown_tag %}`, // undefined tag
+	}
+	mod := NewModule()
+	for _, src := range malformed {
+		t.Run(src, func(t *testing.T) {
+			// render() must surface a clean error, not panic.
+			renderScript := fmt.Sprintf(`load("liquid","render")
+out = render(%q)`, src)
+			if _, err := runRender(t, mod, renderScript); err == nil {
+				t.Errorf("render(%q): expected an error, got nil", src)
+			}
+			// parse() must surface a clean error, not panic.
+			parseScript := fmt.Sprintf(`load("liquid","parse")
+out = parse(%q)`, src)
+			if _, err := runRender(t, mod, parseScript); err == nil {
+				t.Errorf("parse(%q): expected an error, got nil", src)
+			}
+		})
+	}
+}
+
+// TestParseStringRecoversPanic exercises the recover arm of parseString
+// directly: a nil engine makes the underlying ParseString call panic, which the
+// defer/recover must convert into an error rather than letting it escape as a
+// host panic.
+func TestParseStringRecoversPanic(t *testing.T) {
+	tmpl, err := parseString(nil, `{{ x }}`)
+	if err == nil {
+		t.Fatalf("expected an error from a panicking parse, got tmpl=%v", tmpl)
+	}
+	if !strings.Contains(err.Error(), "parse panic") {
+		t.Errorf("error = %v, want it to mention \"parse panic\"", err)
 	}
 }
 
