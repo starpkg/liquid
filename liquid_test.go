@@ -5,6 +5,8 @@ package liquid
 // Sections:
 //   - rendering via the Starlark API (render / parse, dict + kwargs bindings)
 //   - safety: include disabled, output cap, strict mode
+//   - config options end-to-end (strict / max_output_size via the module path)
+//   - templateValue surface (type/str repr, unhashable as a dict key)
 
 import (
 	"fmt"
@@ -148,5 +150,78 @@ func TestCollectBindings(t *testing.T) {
 	}
 	if got, ok := b["k"]; !ok || fmt.Sprintf("%v", got) != "7" {
 		t.Errorf("bindings[k] = %v, want 7", got)
+	}
+}
+
+// --- config options end-to-end (through the module's public render() path) ---
+
+// TestStrictOptionThroughModule exercises the `strict` config option end-to-end:
+// an undefined variable must error when strict, via the Starlark render() API.
+func TestStrictOptionThroughModule(t *testing.T) {
+	const script = `load("liquid","render")
+out = render("[{{ missing }}]")`
+
+	// strict via the constructor option (the explicit public builder path).
+	strict := newModuleWithOptions(
+		genConfigOption(configKeyMaxOutputSize, "", defaultMaxOutputSize),
+		genConfigOption(configKeyStrict, "", true),
+	)
+	if _, err := runRender(t, strict, script); err == nil ||
+		!strings.Contains(err.Error(), "undefined variable") {
+		t.Errorf("strict module: expected undefined-variable error, got %v", err)
+	}
+
+	// strict via the LIQUID_STRICT environment variable.
+	t.Setenv("LIQUID_STRICT", "true")
+	if _, err := runRender(t, NewModule(), script); err == nil ||
+		!strings.Contains(err.Error(), "undefined variable") {
+		t.Errorf("LIQUID_STRICT=true: expected undefined-variable error, got %v", err)
+	}
+
+	// lenient (default): the undefined variable renders empty, no error.
+	t.Setenv("LIQUID_STRICT", "false")
+	if got, err := runRender(t, NewModule(), script); err != nil || got != "[]" {
+		t.Errorf("lenient render = (%q, %v), want (\"[]\", nil)", got, err)
+	}
+}
+
+// TestMaxOutputSizeThroughModule sets a tiny LIQUID_MAX_OUTPUT_SIZE and asserts
+// the output cap fires end-to-end through the render() API.
+func TestMaxOutputSizeThroughModule(t *testing.T) {
+	t.Setenv("LIQUID_MAX_OUTPUT_SIZE", "8")
+	// Output longer than the 8-byte cap must error.
+	_, err := runRender(t, NewModule(), `load("liquid","render")
+out = render("{{ s }}", {"s": "0123456789"})`)
+	if err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Errorf("tiny cap: expected output-limit error, got %v", err)
+	}
+	// Output within the cap still renders.
+	if got, err := runRender(t, NewModule(), `load("liquid","render")
+out = render("{{ s }}", {"s": "ok"})`); err != nil || got != "ok" {
+		t.Errorf("within cap render = (%q, %v), want (\"ok\", nil)", got, err)
+	}
+}
+
+// --- templateValue surface ----------------------------------------------------
+
+// TestTemplateValueSurface parses a template and asserts its type()/str() repr
+// and that using it as a dict key errors (it is unhashable).
+func TestTemplateValueSurface(t *testing.T) {
+	got, err := runRender(t, NewModule(), `load("liquid","parse")
+tmpl = parse("{{ x }}")
+out = type(tmpl) + " " + str(tmpl)`)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if want := "liquid.Template <liquid.Template>"; got != want {
+		t.Errorf("type/str repr = %q, want %q", got, want)
+	}
+
+	// Using a template as a dict key must error (unhashable type).
+	_, err = runRender(t, NewModule(), `load("liquid","parse")
+tmpl = parse("{{ x }}")
+out = {tmpl: 1}`)
+	if err == nil || !strings.Contains(err.Error(), "unhashable") {
+		t.Errorf("expected unhashable-key error, got %v", err)
 	}
 }
