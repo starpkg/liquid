@@ -28,7 +28,7 @@ go run github.com/1set/meta/doccov@master . # the doc-coverage gate (README <-> 
 docker run --rm -v "$PWD":/src -v "$HOME/go/pkg/mod":/go/pkg/mod -w /src golang:1.19 go test -race -count=1 ./...
 ```
 
-There are no network/credential-gated tests in this module — everything runs offline and deterministically. Integration scripts under `../test/liquid/*.star` (if any) live in the **private `starpkg/test` repo** and auto-skip when that directory is absent (e.g. in CI).
+There are no network/credential-gated tests in this module — everything runs offline and deterministically, and there is no external integration harness: the entire test surface lives in `liquid_test.go` (no `../test/liquid/*.star` fixtures, no skip-on-absence logic).
 
 ## Architecture (the part that spans files)
 
@@ -53,7 +53,7 @@ The module runs templates the host may not fully trust. The guarantees below are
 
 ## Test organization
 
-Group by functional goal — **do not add one `*_test.go` per fix.** `liquid_test.go` is the single home, opened with a commented section list; add a new test as a **section** there, not a new file. The sections: rendering via the Starlark API (`TestRenderBindings`, `TestParseReuse`, `TestRenderBadBindings`), filters & tags (`TestFilters`, `TestTagsAndControlFlow`), error & missing-value behavior (`TestErrorMessageShapes`, `TestUndefinedVariableLenientVsStrict`), safety/hardening (`TestIncludeDisabled`, `TestOutputCap`, `TestCappedWriter`, `TestStrictVariables`, `TestMalformedTemplateNoPanic`, `TestParseStringRecoversPanic`), config end-to-end (`TestStrictOptionThroughModule`, `TestMaxOutputSizeThroughModule`), and the `templateValue` surface (`TestTemplateValueSurface`). Tests are table/example-driven; no third-party test framework. Tests that assert exact wrapped error strings (`liquid:` / `liquid.parse:` / `liquid.render:` prefixes) use substring matches so engine source-location detail can vary.
+Group by functional goal — **do not add one `*_test.go` per fix.** `liquid_test.go` is the single home, opened with a commented section list; add a new test as a **section** there, not a new file. The sections: rendering via the Starlark API (`TestRenderBindings`, `TestParseReuse`, `TestRenderBadBindings`, `TestCollectBindings`), filters & tags (`TestFilters`, `TestTagsAndControlFlow`), error & missing-value behavior (`TestErrorMessageShapes`, `TestUndefinedVariableLenientVsStrict`), safety/hardening (`TestIncludeDisabled`, `TestOutputCap`, `TestCappedWriter`, `TestStrictVariables`, `TestMalformedTemplateNoPanic`, `TestParseStringRecoversPanic`), config end-to-end (`TestStrictOptionThroughModule`, `TestMaxOutputSizeThroughModule`), and the `templateValue` surface (`TestTemplateValueSurface`). Tests are table/example-driven; no third-party test framework. Tests that assert exact wrapped error strings (`liquid:` / `liquid.parse:` / `liquid.render:` prefixes) use substring matches so engine source-location detail can vary.
 
 ## Documentation
 
