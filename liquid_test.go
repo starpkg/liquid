@@ -175,82 +175,93 @@ func TestParseRenderArgs(t *testing.T) {
 	}
 }
 
+// mkDict builds a single-entry starlark dict for the bindings tests.
+func mkDict(t *testing.T, k string, v starlark.Value) *starlark.Dict {
+	t.Helper()
+	d := starlark.NewDict(1)
+	if err := d.SetKey(starlark.String(k), v); err != nil {
+		t.Fatalf("dict setup: %v", err)
+	}
+	return d
+}
+
+// bareBuiltin is an unconvertible Starlark value (dataconv rejects it), used to
+// drive the keyword/dict-value conversion error branches.
+func bareBuiltin() *starlark.Builtin {
+	return starlark.NewBuiltin("noop", func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
+		return starlark.None, nil
+	})
+}
+
 // TestCollectBindingsBranches covers the merge rules and error branches of
 // collectBindings beyond the smoke test in TestCollectBindings: nil/None dict,
 // dict + kwargs merge, kwargs overriding the dict, a non-dict argument, and a
-// keyword value that dataconv cannot convert (an unrecognized Starlark type).
+// value (dict or keyword) that dataconv cannot convert. Each row asserts either
+// the resulting key=value pairs or the error substring.
 func TestCollectBindingsBranches(t *testing.T) {
-	mkDict := func(k string, v starlark.Value) *starlark.Dict {
-		d := starlark.NewDict(1)
-		if err := d.SetKey(starlark.String(k), v); err != nil {
-			t.Fatalf("dict setup: %v", err)
-		}
-		return d
+	cases := []struct {
+		name    string
+		dict    starlark.Value
+		kwargs  []starlark.Tuple
+		want    map[string]string // expected stringified bindings (nil if error expected)
+		wantErr string
+	}{
+		{
+			name: "nil dict yields empty map",
+			dict: nil,
+			want: map[string]string{},
+		},
+		{
+			name:   "dict + kwargs merge",
+			dict:   mkDict(t, "a", starlark.MakeInt(1)),
+			kwargs: []starlark.Tuple{{starlark.String("b"), starlark.MakeInt(2)}},
+			want:   map[string]string{"a": "1", "b": "2"},
+		},
+		{
+			name:   "kwargs override dict",
+			dict:   mkDict(t, "x", starlark.MakeInt(1)),
+			kwargs: []starlark.Tuple{{starlark.String("x"), starlark.MakeInt(9)}},
+			want:   map[string]string{"x": "9"},
+		},
+		{
+			name:    "non-dict argument errors",
+			dict:    starlark.MakeInt(5),
+			wantErr: "bindings must be a dict, got int",
+		},
+		{
+			name:    "unconvertible keyword value errors",
+			dict:    starlark.None,
+			kwargs:  []starlark.Tuple{{starlark.String("f"), bareBuiltin()}},
+			wantErr: `keyword "f":`,
+		},
+		{
+			name:    "unconvertible dict value errors",
+			dict:    mkDict(t, "f", bareBuiltin()),
+			wantErr: "bindings:",
+		},
 	}
-
-	t.Run("nil dict yields empty map", func(t *testing.T) {
-		b, err := collectBindings("liquid.render", nil, nil)
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if len(b) != 0 {
-			t.Errorf("bindings = %v, want empty", b)
-		}
-	})
-
-	t.Run("dict + kwargs merge", func(t *testing.T) {
-		b, err := collectBindings("liquid.render", mkDict("a", starlark.MakeInt(1)),
-			[]starlark.Tuple{{starlark.String("b"), starlark.MakeInt(2)}})
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if fmt.Sprintf("%v", b["a"]) != "1" || fmt.Sprintf("%v", b["b"]) != "2" {
-			t.Errorf("merged bindings = %v, want a=1 b=2", b)
-		}
-	})
-
-	t.Run("kwargs override dict", func(t *testing.T) {
-		b, err := collectBindings("liquid.render", mkDict("x", starlark.MakeInt(1)),
-			[]starlark.Tuple{{starlark.String("x"), starlark.MakeInt(9)}})
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if fmt.Sprintf("%v", b["x"]) != "9" {
-			t.Errorf("bindings[x] = %v, want 9 (kwargs win)", b["x"])
-		}
-	})
-
-	t.Run("non-dict argument errors", func(t *testing.T) {
-		_, err := collectBindings("liquid.render", starlark.MakeInt(5), nil)
-		if err == nil || !strings.Contains(err.Error(), "bindings must be a dict, got int") {
-			t.Errorf("err = %v, want a non-dict error", err)
-		}
-	})
-
-	t.Run("unconvertible keyword value errors", func(t *testing.T) {
-		fn := starlark.NewBuiltin("noop", func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
-			return starlark.None, nil
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b, err := collectBindings("liquid.render", c.dict, c.kwargs)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(b) != len(c.want) {
+				t.Fatalf("bindings = %v, want %v", b, c.want)
+			}
+			for k, want := range c.want {
+				if got := fmt.Sprintf("%v", b[k]); got != want {
+					t.Errorf("bindings[%q] = %q, want %q", k, got, want)
+				}
+			}
 		})
-		_, err := collectBindings("liquid.render", starlark.None,
-			[]starlark.Tuple{{starlark.String("f"), fn}})
-		if err == nil || !strings.Contains(err.Error(), `keyword "f":`) {
-			t.Errorf("err = %v, want a keyword-conversion error", err)
-		}
-	})
-
-	t.Run("unconvertible dict value errors", func(t *testing.T) {
-		fn := starlark.NewBuiltin("noop", func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
-			return starlark.None, nil
-		})
-		d := starlark.NewDict(1)
-		if err := d.SetKey(starlark.String("f"), fn); err != nil {
-			t.Fatalf("dict setup: %v", err)
-		}
-		_, err := collectBindings("liquid.render", d, nil)
-		if err == nil || !strings.Contains(err.Error(), "bindings:") {
-			t.Errorf("err = %v, want a dict-value conversion error", err)
-		}
-	})
+	}
 }
 
 // TestParseArgErrors covers parse()'s argument validation: a non-string source
@@ -604,26 +615,31 @@ func TestOutputCapNormalizedOnFlushPanic(t *testing.T) {
 	// without the cw.exceeded check in the recover arm this would surface as a
 	// "render panic: ...rendered output exceeds..." wrapper. The fix normalizes it
 	// to the documented errOutputLimit.
-	const src = "{{ a }}\n   " // 5 content bytes + "\n   " (4 ws bytes) = 9 > 8
-	bindings := map[string]interface{}{"a": strings.Repeat("Z", 5)}
-
-	t.Run("renderWith", func(t *testing.T) {
-		_, err := renderWith(osliquid.NewEngine(), src, bindings, 8)
-		if err != errOutputLimit {
-			t.Fatalf("renderWith over-cap flush = %v, want errOutputLimit (clean, not a panic wrapper)", err)
-		}
-	})
-
-	t.Run("Template.renderTemplate", func(t *testing.T) {
-		tmpl, perr := parseString(osliquid.NewEngine(), src)
-		if perr != nil {
-			t.Fatalf("parse: %v", perr)
-		}
-		tv := &templateValue{tmpl: tmpl, maxOutput: 8}
-		if _, err := tv.renderTemplate(bindings); err != errOutputLimit {
-			t.Fatalf("renderTemplate over-cap flush = %v, want errOutputLimit", err)
-		}
-	})
+	// Two ways to overflow the 8-byte cap, both of which must converge on the
+	// single documented errOutputLimit (not a "render panic" wrapper):
+	//   - flush: content (5 'Z') fits, but the buffered trailing whitespace
+	//     ("\n   ", 4 bytes) is flushed at end-of-render and tips it over → the
+	//     engine panics on the failed flush, caught by the recover arm.
+	//   - direct: the content itself (64 'Z') overflows on the write → the normal
+	//     ParseAndFRender error path.
+	caps := []struct {
+		name   string
+		src    string
+		val    string
+		render func(src string, val string) (string, error)
+	}{
+		{"renderWith flush", "{{ a }}\n   ", strings.Repeat("Z", 5), capRenderWith},
+		{"renderWith direct", "{{ a }}", strings.Repeat("Z", 64), capRenderWith},
+		{"Template flush", "{{ a }}\n   ", strings.Repeat("Z", 5), capRenderTemplate},
+		{"Template direct", "{{ a }}", strings.Repeat("Z", 64), capRenderTemplate},
+	}
+	for _, c := range caps {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := c.render(c.src, c.val); err != errOutputLimit {
+				t.Fatalf("over-cap = %v, want errOutputLimit (clean, not a panic wrapper)", err)
+			}
+		})
+	}
 
 	// End-to-end through the public render() API the error message must be the
 	// documented one (no "render panic" leak), and not crash the host.
@@ -638,30 +654,23 @@ out = render("{{ a }}\n   ", {"a": "ZZZZZ"})`)
 			t.Errorf("error leaked a 'render panic' wrapper: %v", err)
 		}
 	})
+}
 
-	// A direct-write overflow (content itself exceeds the cap) still returns the
-	// same clean errOutputLimit via the normal ParseAndFRender error path — both
-	// the flush-panic and direct-write overflows converge on one documented error.
-	t.Run("direct-write overflow", func(t *testing.T) {
-		_, err := renderWith(osliquid.NewEngine(), "{{ a }}",
-			map[string]interface{}{"a": strings.Repeat("Z", 64)}, 8)
-		if err != errOutputLimit {
-			t.Fatalf("renderWith direct over-cap = %v, want errOutputLimit", err)
-		}
-	})
+// capRenderWith renders src/val through the one-shot renderWith path at an
+// 8-byte cap (used by the output-cap table).
+func capRenderWith(src, val string) (string, error) {
+	return renderWith(osliquid.NewEngine(), src, map[string]interface{}{"a": val}, 8)
+}
 
-	// A compiled template enforces the cap on a direct-write overflow too (the
-	// renderTemplate normal-error arm).
-	t.Run("Template direct-write overflow", func(t *testing.T) {
-		tmpl, perr := parseString(osliquid.NewEngine(), "{{ a }}")
-		if perr != nil {
-			t.Fatalf("parse: %v", perr)
-		}
-		tv := &templateValue{tmpl: tmpl, maxOutput: 8}
-		if _, err := tv.renderTemplate(map[string]interface{}{"a": strings.Repeat("Z", 64)}); err != errOutputLimit {
-			t.Fatalf("renderTemplate direct over-cap = %v, want errOutputLimit", err)
-		}
-	})
+// capRenderTemplate parses src then renders it through the compiled-template
+// path at an 8-byte cap (used by the output-cap table).
+func capRenderTemplate(src, val string) (string, error) {
+	tmpl, err := parseString(osliquid.NewEngine(), src)
+	if err != nil {
+		return "", err
+	}
+	tv := &templateValue{tmpl: tmpl, maxOutput: 8}
+	return tv.renderTemplate(map[string]interface{}{"a": val})
 }
 
 // --- config options end-to-end (through the module's public render() path) ---
@@ -745,17 +754,21 @@ out = {tmpl: 1}`)
 func TestTemplateValueProtocol(t *testing.T) {
 	tv := &templateValue{maxOutput: defaultMaxOutputSize}
 
-	if got := tv.Type(); got != "liquid.Template" {
-		t.Errorf("Type() = %q, want %q", got, "liquid.Template")
+	// Scalar string-returning methods.
+	scalars := []struct{ name, got, want string }{
+		{"Type", tv.Type(), "liquid.Template"},
+		{"String", tv.String(), "<liquid.Template>"},
 	}
-	if got := tv.String(); got != "<liquid.Template>" {
-		t.Errorf("String() = %q, want %q", got, "<liquid.Template>")
+	for _, s := range scalars {
+		if s.got != s.want {
+			t.Errorf("%s() = %q, want %q", s.name, s.got, s.want)
+		}
 	}
-	if got := tv.Truth(); got != starlark.True {
-		t.Errorf("Truth() = %v, want True", got)
+
+	if tv.Truth() != starlark.True {
+		t.Errorf("Truth() = %v, want True", tv.Truth())
 	}
-	// Freeze is a no-op; it must not panic.
-	tv.Freeze()
+	tv.Freeze() // a no-op; it must not panic.
 
 	if _, err := tv.Hash(); err == nil || !strings.Contains(err.Error(), "unhashable") {
 		t.Errorf("Hash() error = %v, want unhashable", err)
@@ -765,6 +778,14 @@ func TestTemplateValueProtocol(t *testing.T) {
 		t.Errorf("AttrNames() = %v, want [render]", names)
 	}
 
+	assertRenderAttr(t, tv)
+}
+
+// assertRenderAttr checks that templateValue exposes exactly the render
+// attribute (a builtin) and reports unknown attributes as (nil, nil) so the
+// interpreter surfaces a no-such-attr error.
+func assertRenderAttr(t *testing.T, tv *templateValue) {
+	t.Helper()
 	got, err := tv.Attr("render")
 	if err != nil {
 		t.Fatalf("Attr(render): %v", err)
@@ -772,8 +793,6 @@ func TestTemplateValueProtocol(t *testing.T) {
 	if _, ok := got.(*starlark.Builtin); !ok {
 		t.Errorf("Attr(render) = %T, want *starlark.Builtin", got)
 	}
-
-	// Unknown attribute: (nil, nil) so the interpreter reports no-such-attr.
 	if v, err := tv.Attr("nope"); v != nil || err != nil {
 		t.Errorf("Attr(nope) = (%v, %v), want (nil, nil)", v, err)
 	}
