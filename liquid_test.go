@@ -104,64 +104,40 @@ func wantErrContains(t *testing.T, err error, sub string) {
 
 // --- argument parsing & validation -------------------------------------------
 
+// parseRenderArgsCase is one row of the parseRenderArgs table.
+type parseRenderArgsCase struct {
+	name       string
+	args       starlark.Tuple
+	kwargs     []starlark.Tuple
+	wantSource string
+	wantErrSub string // "" means expect no error
+}
+
+// parseRenderArgsCases lists the happy paths and each clean-error branch
+// parseRenderArgs can hit (dict reused across rows).
+func parseRenderArgsCases() []parseRenderArgsCase {
+	dict := starlark.NewDict(1)
+	_ = dict.SetKey(starlark.String("k"), starlark.MakeInt(1))
+	return []parseRenderArgsCase{
+		{name: "source only", args: starlark.Tuple{starlark.String("hi {{ x }}")}, wantSource: "hi {{ x }}"},
+		{name: "source + dict", args: starlark.Tuple{starlark.String("t"), dict}, wantSource: "t"},
+		{name: "source + None bindings", args: starlark.Tuple{starlark.String("t"), starlark.None}, wantSource: "t"},
+		{name: "bytes source", args: starlark.Tuple{starlark.Bytes("raw {{ x }}")}, wantSource: "raw {{ x }}"},
+		{name: "missing source", args: starlark.Tuple{}, wantErrSub: "liquid.render: missing source argument"},
+		{name: "too many positionals", args: starlark.Tuple{starlark.String("t"), dict, starlark.String("extra")},
+			wantErrSub: "liquid.render: got 3 positional arguments, want at most 2 (source, bindings)"},
+		{name: "non-string source", args: starlark.Tuple{starlark.MakeInt(42)}, wantErrSub: "liquid.render: source:"},
+		{name: "non-dict bindings", args: starlark.Tuple{starlark.String("t"), starlark.MakeInt(7)},
+			wantErrSub: "liquid.render: bindings must be a dict, got int"},
+	}
+}
+
 // TestParseRenderArgs exercises parseRenderArgs directly (no TTY/network): the
 // happy path plus each clean-error branch a script can hit — missing source,
 // too many positionals, and a non-string source. Asserts both the returned
 // source/bindings and the exact wrapped error strings the README promises.
 func TestParseRenderArgs(t *testing.T) {
-	dict := starlark.NewDict(1)
-	if err := dict.SetKey(starlark.String("k"), starlark.MakeInt(1)); err != nil {
-		t.Fatalf("dict setup: %v", err)
-	}
-	cases := []struct {
-		name       string
-		args       starlark.Tuple
-		kwargs     []starlark.Tuple
-		wantSource string
-		wantErrSub string // "" means expect no error
-	}{
-		{
-			name:       "source only",
-			args:       starlark.Tuple{starlark.String("hi {{ x }}")},
-			wantSource: "hi {{ x }}",
-		},
-		{
-			name:       "source + dict",
-			args:       starlark.Tuple{starlark.String("t"), dict},
-			wantSource: "t",
-		},
-		{
-			name:       "source + None bindings",
-			args:       starlark.Tuple{starlark.String("t"), starlark.None},
-			wantSource: "t",
-		},
-		{
-			name:       "bytes source",
-			args:       starlark.Tuple{starlark.Bytes("raw {{ x }}")},
-			wantSource: "raw {{ x }}",
-		},
-		{
-			name:       "missing source",
-			args:       starlark.Tuple{},
-			wantErrSub: "liquid.render: missing source argument",
-		},
-		{
-			name:       "too many positionals",
-			args:       starlark.Tuple{starlark.String("t"), dict, starlark.String("extra")},
-			wantErrSub: "liquid.render: got 3 positional arguments, want at most 2 (source, bindings)",
-		},
-		{
-			name:       "non-string source",
-			args:       starlark.Tuple{starlark.MakeInt(42)},
-			wantErrSub: "liquid.render: source:",
-		},
-		{
-			name:       "non-dict bindings",
-			args:       starlark.Tuple{starlark.String("t"), starlark.MakeInt(7)},
-			wantErrSub: "liquid.render: bindings must be a dict, got int",
-		},
-	}
-	for _, c := range cases {
+	for _, c := range parseRenderArgsCases() {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			src, bindings, err := parseRenderArgs("liquid.render", c.args, c.kwargs)
@@ -207,54 +183,39 @@ func bareBuiltin() *starlark.Builtin {
 	})
 }
 
-// TestCollectBindingsBranches covers the merge rules and error branches of
-// collectBindings beyond the smoke test in TestCollectBindings: nil/None dict,
-// dict + kwargs merge, kwargs overriding the dict, a non-dict argument, and a
-// value (dict or keyword) that dataconv cannot convert. Each row asserts either
-// the resulting key=value pairs or the error substring.
-func TestCollectBindingsBranches(t *testing.T) {
-	cases := []struct {
-		name    string
-		dict    starlark.Value
-		kwargs  []starlark.Tuple
-		want    map[string]string // expected stringified bindings (nil if error expected)
-		wantErr string
-	}{
-		{
-			name: "nil dict yields empty map",
-			dict: nil,
-			want: map[string]string{},
-		},
-		{
-			name:   "dict + kwargs merge",
-			dict:   mkDict(t, "a", starlark.MakeInt(1)),
+// collectBindingsCase is one row of the collectBindings table.
+type collectBindingsCase struct {
+	name    string
+	dict    starlark.Value
+	kwargs  []starlark.Tuple
+	want    map[string]string // expected stringified bindings (nil if error expected)
+	wantErr string
+}
+
+// collectBindingsCases lists the merge rules and error branches of
+// collectBindings beyond the smoke test in TestCollectBindings.
+func collectBindingsCases(t *testing.T) []collectBindingsCase {
+	return []collectBindingsCase{
+		{name: "nil dict yields empty map", dict: nil, want: map[string]string{}},
+		{name: "dict + kwargs merge", dict: mkDict(t, "a", starlark.MakeInt(1)),
 			kwargs: []starlark.Tuple{{starlark.String("b"), starlark.MakeInt(2)}},
-			want:   map[string]string{"a": "1", "b": "2"},
-		},
-		{
-			name:   "kwargs override dict",
-			dict:   mkDict(t, "x", starlark.MakeInt(1)),
+			want:   map[string]string{"a": "1", "b": "2"}},
+		{name: "kwargs override dict", dict: mkDict(t, "x", starlark.MakeInt(1)),
 			kwargs: []starlark.Tuple{{starlark.String("x"), starlark.MakeInt(9)}},
-			want:   map[string]string{"x": "9"},
-		},
-		{
-			name:    "non-dict argument errors",
-			dict:    starlark.MakeInt(5),
-			wantErr: "bindings must be a dict, got int",
-		},
-		{
-			name:    "unconvertible keyword value errors",
-			dict:    starlark.None,
-			kwargs:  []starlark.Tuple{{starlark.String("f"), bareBuiltin()}},
-			wantErr: `keyword "f":`,
-		},
-		{
-			name:    "unconvertible dict value errors",
-			dict:    mkDict(t, "f", bareBuiltin()),
-			wantErr: "bindings:",
-		},
+			want:   map[string]string{"x": "9"}},
+		{name: "non-dict argument errors", dict: starlark.MakeInt(5), wantErr: "bindings must be a dict, got int"},
+		{name: "unconvertible keyword value errors", dict: starlark.None,
+			kwargs: []starlark.Tuple{{starlark.String("f"), bareBuiltin()}}, wantErr: `keyword "f":`},
+		{name: "unconvertible dict value errors", dict: mkDict(t, "f", bareBuiltin()), wantErr: "bindings:"},
 	}
-	for _, c := range cases {
+}
+
+// TestCollectBindingsBranches covers the merge rules and error branches of
+// collectBindings: nil/None dict, dict + kwargs merge, kwargs overriding the
+// dict, a non-dict argument, and a value (dict or keyword) that dataconv cannot
+// convert. Each row asserts either the resulting key=value pairs or the error.
+func TestCollectBindingsBranches(t *testing.T) {
+	for _, c := range collectBindingsCases(t) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			b, err := collectBindings("liquid.render", c.dict, c.kwargs)
