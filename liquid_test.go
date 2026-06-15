@@ -94,6 +94,14 @@ out = render("x", [1,2,3])`) // list, not dict
 	}
 }
 
+// wantErrContains fails unless err is non-nil and its message contains sub.
+func wantErrContains(t *testing.T, err error, sub string) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), sub) {
+		t.Fatalf("error = %v, want it to contain %q", err, sub)
+	}
+}
+
 // --- argument parsing & validation -------------------------------------------
 
 // TestParseRenderArgs exercises parseRenderArgs directly (no TTY/network): the
@@ -157,9 +165,7 @@ func TestParseRenderArgs(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			src, bindings, err := parseRenderArgs("liquid.render", c.args, c.kwargs)
 			if c.wantErrSub != "" {
-				if err == nil || !strings.Contains(err.Error(), c.wantErrSub) {
-					t.Fatalf("error = %v, want it to contain %q", err, c.wantErrSub)
-				}
+				wantErrContains(t, err, c.wantErrSub)
 				return
 			}
 			if err != nil {
@@ -244,9 +250,7 @@ func TestCollectBindingsBranches(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			b, err := collectBindings("liquid.render", c.dict, c.kwargs)
 			if c.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-					t.Fatalf("err = %v, want it to contain %q", err, c.wantErr)
-				}
+				wantErrContains(t, err, c.wantErr)
 				return
 			}
 			if err != nil {
@@ -288,9 +292,7 @@ out = parse("{% if %}")`,
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := runRender(t, mod, c.script)
-			if err == nil || !strings.Contains(err.Error(), c.wantSub) {
-				t.Fatalf("error = %v, want it to contain %q", err, c.wantSub)
-			}
+			wantErrContains(t, err, c.wantSub)
 		})
 	}
 }
@@ -765,26 +767,30 @@ func TestTemplateValueProtocol(t *testing.T) {
 		}
 	}
 
+	tv.Freeze() // a no-op; it must not panic.
+	assertTemplateValueProtocol(t, tv)
+	assertTemplateAttrs(t, tv)
+}
+
+// assertTemplateValueProtocol checks Truth (always true), Hash (unhashable),
+// and AttrNames (exactly ["render"]).
+func assertTemplateValueProtocol(t *testing.T, tv *templateValue) {
+	t.Helper()
 	if tv.Truth() != starlark.True {
 		t.Errorf("Truth() = %v, want True", tv.Truth())
 	}
-	tv.Freeze() // a no-op; it must not panic.
-
 	if _, err := tv.Hash(); err == nil || !strings.Contains(err.Error(), "unhashable") {
 		t.Errorf("Hash() error = %v, want unhashable", err)
 	}
-
 	if names := tv.AttrNames(); len(names) != 1 || names[0] != "render" {
 		t.Errorf("AttrNames() = %v, want [render]", names)
 	}
-
-	assertRenderAttr(t, tv)
 }
 
-// assertRenderAttr checks that templateValue exposes exactly the render
-// attribute (a builtin) and reports unknown attributes as (nil, nil) so the
-// interpreter surfaces a no-such-attr error.
-func assertRenderAttr(t *testing.T, tv *templateValue) {
+// assertTemplateAttrs checks that the render attribute is a builtin and that an
+// unknown attribute is reported as (nil, nil) so the interpreter surfaces a
+// no-such-attr error.
+func assertTemplateAttrs(t *testing.T, tv *templateValue) {
 	t.Helper()
 	got, err := tv.Attr("render")
 	if err != nil {
@@ -824,9 +830,7 @@ out = tmpl.render([1, 2, 3])`,
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := runRender(t, mod, c.script)
-			if err == nil || !strings.Contains(err.Error(), c.wantSub) {
-				t.Fatalf("error = %v, want it to contain %q", err, c.wantSub)
-			}
+			wantErrContains(t, err, c.wantSub)
 		})
 	}
 }
