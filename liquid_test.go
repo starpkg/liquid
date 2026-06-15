@@ -162,22 +162,30 @@ func TestParseRenderArgs(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
+		c := c
 		t.Run(c.name, func(t *testing.T) {
 			src, bindings, err := parseRenderArgs("liquid.render", c.args, c.kwargs)
 			if c.wantErrSub != "" {
 				wantErrContains(t, err, c.wantErrSub)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if src != c.wantSource {
-				t.Errorf("source = %q, want %q", src, c.wantSource)
-			}
-			if bindings == nil {
-				t.Errorf("bindings = nil, want a non-nil map")
-			}
+			assertParsedArgs(t, src, bindings, err, c.wantSource)
 		})
+	}
+}
+
+// assertParsedArgs fails unless parseRenderArgs returned no error, the expected
+// source, and a non-nil bindings map.
+func assertParsedArgs(t *testing.T, src string, bindings map[string]interface{}, err error, wantSource string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if src != wantSource {
+		t.Errorf("source = %q, want %q", src, wantSource)
+	}
+	if bindings == nil {
+		t.Errorf("bindings = nil, want a non-nil map")
 	}
 }
 
@@ -247,24 +255,32 @@ func TestCollectBindingsBranches(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
+		c := c
 		t.Run(c.name, func(t *testing.T) {
 			b, err := collectBindings("liquid.render", c.dict, c.kwargs)
 			if c.wantErr != "" {
 				wantErrContains(t, err, c.wantErr)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(b) != len(c.want) {
-				t.Fatalf("bindings = %v, want %v", b, c.want)
-			}
-			for k, want := range c.want {
-				if got := fmt.Sprintf("%v", b[k]); got != want {
-					t.Errorf("bindings[%q] = %q, want %q", k, got, want)
-				}
-			}
+			assertBindings(t, b, err, c.want)
 		})
+	}
+}
+
+// assertBindings fails unless collectBindings returned no error and the
+// stringified bindings exactly match want.
+func assertBindings(t *testing.T, b map[string]interface{}, err error, want map[string]string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(b) != len(want) {
+		t.Fatalf("bindings = %v, want %v", b, want)
+	}
+	for k, w := range want {
+		if got := fmt.Sprintf("%v", b[k]); got != w {
+			t.Errorf("bindings[%q] = %q, want %q", k, got, w)
+		}
 	}
 }
 
