@@ -5,6 +5,14 @@
 Render [Liquid](https://shopify.github.io/liquid/) templates from Starlark, built
 on [osteele/liquid](https://github.com/osteele/liquid) (v1.4.0).
 
+starpkg gives Starlark scripts **support for necessary local operations** plus
+**simple abstractions over common online services**, for ease of use. `liquid`
+is a **local capability** — a pure-Go, offline text-templating primitive with no
+network or filesystem reach. It depends downward on `starpkg/base` (the
+module/config system), `1set/starlet` (the Machine + the `dataconv` value
+bridge), and transitively `1set/starlight` + `go.starlark.net`; nothing in the
+ecosystem depends on it.
+
 Liquid is a **sandboxed** template language: a template can only see the
 variables you place in its bindings — there is no implicit access to host state
 or script globals. This module mirrors that model exactly: variables are passed
