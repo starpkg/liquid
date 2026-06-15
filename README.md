@@ -1,6 +1,8 @@
 # 💧 `liquid` — Liquid templates for Starlark
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/starpkg/liquid.svg)](https://pkg.go.dev/github.com/starpkg/liquid)
+[![codecov](https://codecov.io/gh/starpkg/liquid/graph/badge.svg)](https://codecov.io/gh/starpkg/liquid)
+![binary footprint](https://img.shields.io/badge/binary_footprint-%2B0.6_MB-blue)
 
 Render [Liquid](https://shopify.github.io/liquid/) templates from Starlark, built
 on [osteele/liquid](https://github.com/osteele/liquid) (v1.4.0).
