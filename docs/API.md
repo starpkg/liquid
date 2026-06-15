@@ -25,6 +25,7 @@ keyword arguments.
 - [Bindings: dict and keyword merge](#bindings-dict-and-keyword-merge)
 - [Filters](#filters)
 - [Tags and control flow](#tags-and-control-flow)
+- [Compatibility with official Liquid](#compatibility-with-official-liquid)
 - [Errors and missing values](#errors-and-missing-values)
 - [Variable flow](#variable-flow)
 - [Safety](#safety)
@@ -172,11 +173,13 @@ The **48 standard filters** available in v1.4.0 are:
 | Math | `abs` `ceil` `divided_by` `floor` `minus` `modulo` `plus` `round` `times` |
 | Other | `date` `default` `inspect` `json` `type` |
 
-> **RE2-style limits.** osteele/liquid does **not** implement Shopify's
-> regex-based filters (no `regex_replace`); `replace`/`remove`/`split` operate on
-> literal substrings, not patterns. There is no `where` filter either. If you
-> need regular expressions, do that work in Starlark (or the `regex` module)
-> before passing values into a template.
+> **Not every Shopify filter is present, and there are no regex filters.**
+> `replace` / `remove` / `split` operate on literal substrings, not patterns
+> (there is no `regex_replace`); do regular-expression work in Starlark before
+> passing values into a template. For the exact, tested list of filters and tags
+> this engine does **not** implement — and which of those are *standard Liquid the
+> engine omits* versus *Shopify theme-only* — see
+> [Compatibility with official Liquid](#compatibility-with-official-liquid).
 
 ## Tags and control flow
 
@@ -198,6 +201,68 @@ render("{% unless ok %}blocked{% endunless %}", {"ok": False})       # => "block
 render("{% case n %}{% when 1 %}one{% when 2 %}two{% else %}many{% endcase %}",
        {"n": 2})                                                     # => "two"
 ```
+
+## Compatibility with official Liquid
+
+This module wraps [`osteele/liquid`](https://github.com/osteele/liquid) v1.4.0, a
+pure-Go engine that implements the **core, standard** Liquid language — *not*
+Shopify's theme-specific extensions — and this module adds a small sandbox on top
+(see [Safety](#safety)). The tables below are the precise difference from official
+Shopify Liquid; every entry was verified by running the feature through this
+module, so the distinction between *"we disabled it"* and *"the engine never had
+it"* is exact.
+
+### What this module restricts (deliberate, for sandboxing)
+
+| Feature | Status | Effect |
+|---------|--------|--------|
+| `{% include %}` | **disabled** | The **only** language feature removed: the filesystem `include` tag always errors, so a template cannot read host files. |
+| Output size | capped | Rendered output is bounded by `max_output_size` (256 KiB default); exceeding it returns an error instead of exhausting memory. |
+| Bindings | sandboxed | A template sees only the bindings you pass — no host or script-global state. |
+| Undefined variables | lenient by default | Render as empty (the official default); the `strict` option turns them into errors. |
+| Panics | recovered | Any parse/render panic becomes an ordinary `liquid:` error. |
+
+Everything else in core standard Liquid is available **unchanged**: the `assign`,
+`capture`, `if` / `elsif` / `else`, `unless`, `case` / `when`, `for` (with ranges,
+`limit`, `offset`, `reversed`, `break`, `continue`, and the `forloop` object),
+`cycle`, `tablerow`, `comment`, and `raw` tags; whitespace control (`{{- -}}`,
+`{%- -%}`); the `==` `!=` `>` `<` `>=` `<=` `and` `or` `contains` operators; and
+all of the string, array, and math filters listed under [Filters](#filters).
+
+### Liquid features the engine does NOT implement
+
+These are **not** disabled by this module — `osteele/liquid` v1.4.0 simply does not
+implement them. They split by reason. **Standard Liquid that the engine omits** —
+if you need one of these, compute the value in Starlark first and pass it in as a
+binding:
+
+| Kind | Not implemented |
+|------|-----------------|
+| Tags | `{% for … %}{% else %}` (the empty-collection branch), `{% increment %}`, `{% decrement %}`, `{% echo %}`, inline `{% liquid %}` |
+| Filters | `at_least`, `at_most` |
+
+**Shopify *theme* features** — never part of a generic Liquid engine:
+
+| Kind | Not implemented |
+|------|-----------------|
+| Tags | `{% render %}`, `{% layout %}`, `{% section %}`, `{% form %}`, `{% paginate %}`, `{% style %}`, … |
+| Filters | `where`, `money`, `img_url`, `asset_url`, `regex_replace`, and the other theme/asset filters |
+
+A missing tag raises `liquid: Liquid error: undefined tag "<name>"`; a missing
+filter raises `liquid: Liquid error: undefined filter "<name>"`.
+
+### Behavioural differences to know
+
+- **Truthiness follows Liquid, not Python/Starlark.** Only `nil` and `false` are
+  falsy; `0` and the empty string `""` are **truthy**. So `{% if 0 %}` and
+  `{% if "" %}` both take the *true* branch — the opposite of how the same values
+  behave in the surrounding Starlark script.
+- **`divided_by` is integer division for integer operands.**
+  `{{ 10 | divided_by: 3 }}` → `3`; pass a float for true division
+  (`{{ 10 | divided_by: 3.0 }}` → `3.33…`). This matches Shopify.
+- **`inspect`, `json`, and `type` are engine extras** beyond Shopify's standard
+  filter set. `type` returns the Go type name (e.g. `[]interface {}`) — handy for
+  debugging, but do not depend on its exact wording.
 
 ## Errors and missing values
 
