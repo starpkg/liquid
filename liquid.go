@@ -204,12 +204,20 @@ func (m *Module) renderSource(source string, bindings map[string]interface{}) (s
 
 // renderWith renders with a prepared engine, recovering panics and capping output.
 func renderWith(engine *liquid.Engine, source string, bindings map[string]interface{}, maxOutput int) (out string, err error) {
+	cw := &cappedWriter{limit: maxOutput}
 	defer func() {
 		if r := recover(); r != nil {
+			// The engine panics when a buffered flush fails (render.go's
+			// Flush/TrimLeft), so an output-cap overflow can arrive here rather
+			// than as the ParseAndFRender error below. Normalize it to the
+			// documented errOutputLimit instead of a generic "render panic".
+			if cw.exceeded {
+				out, err = "", errOutputLimit
+				return
+			}
 			out, err = "", fmt.Errorf("liquid: render panic: %v", r)
 		}
 	}()
-	cw := &cappedWriter{limit: maxOutput}
 	if serr := engine.ParseAndFRender(cw, []byte(source), liquid.Bindings(bindings)); serr != nil {
 		if cw.exceeded {
 			return "", errOutputLimit
