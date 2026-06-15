@@ -60,12 +60,19 @@ func (t *templateValue) render(thread *starlark.Thread, b *starlark.Builtin, arg
 
 // renderTemplate renders the compiled template, recovering panics and capping output.
 func (t *templateValue) renderTemplate(bindings map[string]interface{}) (out string, err error) {
+	cw := &cappedWriter{limit: t.maxOutput}
 	defer func() {
 		if r := recover(); r != nil {
+			// The engine panics when a buffered flush fails, so an output-cap
+			// overflow can arrive here rather than as the FRender error below.
+			// Normalize it to the documented errOutputLimit (mirrors renderWith).
+			if cw.exceeded {
+				out, err = "", errOutputLimit
+				return
+			}
 			out, err = "", fmt.Errorf("liquid: render panic: %v", r)
 		}
 	}()
-	cw := &cappedWriter{limit: t.maxOutput}
 	if serr := t.tmpl.FRender(cw, liquid.Bindings(bindings)); serr != nil {
 		if cw.exceeded {
 			return "", errOutputLimit
