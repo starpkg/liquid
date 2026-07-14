@@ -357,14 +357,20 @@ An option's value resolves in priority order: an explicit `set_<key>` value, the
 environment variable, then the default. These options apply to every subsequent
 `render` / `parse` call (and to templates compiled by `parse`).
 
-None of the `liquid` options are secret, so every option exposes **both**
-`get_<key>` and `set_<key>`. (A secret option would expose only its `set_<key>`
-accessor — never a getter — but this module has none.)
+Most options expose **both** `get_<key>` and `set_<key>`. The exception is
+`max_render_time`, a **host-only** DoS lever: it exposes `get_max_render_time`
+but **`set_max_render_time` is intentionally NOT generated**, so a script cannot
+disable or raise the render time limit. (A secret option, by contrast, would
+expose only its `set_<key>` accessor — never a getter — but this module has
+none.) The host configures `max_render_time` in Go or via the
+`LIQUID_MAX_RENDER_TIME` env var, whose value is snapshotted at construction so a
+runtime env mutation cannot widen it.
 
 | Option | Getter | Setter | Type | Env var | Default | Description |
 |--------|--------|--------|------|---------|---------|-------------|
 | `max_output_size` | `get_max_output_size` | `set_max_output_size` | int | `LIQUID_MAX_OUTPUT_SIZE` | `262144` | Maximum rendered output size in bytes (256 KiB); exceeding it returns an error |
 | `strict` | `get_strict` | `set_strict` | bool | `LIQUID_STRICT` | `false` | Error when a template references an undefined variable (default: render it as empty, per Liquid) |
+| `max_render_time` | `get_max_render_time` | `set_max_render_time` — **host-only, not generated** | float | `LIQUID_MAX_RENDER_TIME` | `0` | Maximum wall-clock seconds for a single render (`0` = no module limit; the render is still bounded by the thread context deadline if the host set one). A render exceeding it returns an error |
 
 **Example:**
 

@@ -6,15 +6,17 @@
 // passed explicitly as a bindings dict (and/or keyword arguments) from the
 // script, converted to the engine's Bindings (map[string]interface{}).
 //
-// Safety: rendered output is capped (ADR-010), render panics are recovered into
-// errors, and the filesystem {% include %} tag is disabled so a template cannot
-// read host files.
+// Safety: rendered output is capped (ADR-010), a single render is bounded by a
+// wall-clock deadline (the thread context plus the host-only max_render_time),
+// render panics are recovered into errors, and the filesystem {% include %} tag
+// is disabled so a template cannot read host files.
 package liquid
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/1set/starlet"
 	"github.com/1set/starlet/dataconv"
@@ -22,6 +24,7 @@ import (
 	"github.com/osteele/liquid"
 	"github.com/osteele/liquid/render"
 	"github.com/starpkg/base"
+	"github.com/starpkg/base/util"
 	"go.starlark.net/starlark"
 )
 
@@ -32,15 +35,22 @@ const ModuleName = "liquid"
 const (
 	configKeyMaxOutputSize = "max_output_size"
 	configKeyStrict        = "strict"
+	configKeyMaxRenderTime = "max_render_time"
 )
 
 // defaultMaxOutputSize bounds rendered output (ADR-010).
 const defaultMaxOutputSize = 256 * 1024 // 256 KiB
 
+// defaultMaxRenderTime bounds a single render's wall-clock time. 0 = no
+// module-level limit (the render is still bounded by the thread context
+// deadline, if the host set one). Default 0 keeps historical behavior.
+const defaultMaxRenderTime = 0.0
+
 var (
-	none            = starlark.None
-	errOutputLimit  = errors.New("liquid: rendered output exceeds the configured maximum size")
-	errIncludeUsage = errors.New("liquid: the {% include %} tag is disabled (no filesystem access)")
+	none             = starlark.None
+	errOutputLimit   = errors.New("liquid: rendered output exceeds the configured maximum size")
+	errIncludeUsage  = errors.New("liquid: the {% include %} tag is disabled (no filesystem access)")
+	errRenderTimeout = errors.New("liquid: render exceeded the time limit")
 )
 
 // Module wraps a ConfigurableModule with Liquid-specific functions.
@@ -54,21 +64,25 @@ func NewModule() *Module {
 	return newModuleWithOptions(
 		genConfigOption(configKeyMaxOutputSize, "Maximum rendered output size in bytes", defaultMaxOutputSize),
 		genConfigOption(configKeyStrict, "Error when a template references an undefined variable", false),
+		// max_render_time is a DoS lever (bounds a single render's wall-clock
+		// time), so it is HOST-ONLY: a script must not be able to disable or raise
+		// it. base snapshots its env at construction, so runtime env mutation
+		// (e.g. via a runtime.setenv builtin) cannot widen it either.
+		genConfigOption(configKeyMaxRenderTime, "Maximum wall-clock seconds for a single render (0 = no module limit)", defaultMaxRenderTime).
+			SetHostOnly(true),
 	)
 }
 
 func genConfigOption[T any](name, description string, defaultValue T) *base.ConfigOption[T] {
-	return base.NewConfigOption(defaultValue).
-		WithName(name).
-		WithDescription(description).
-		WithEnvVar("LIQUID_" + upper(name))
+	return base.NewNamedConfigOption(ModuleName, name, description, defaultValue)
 }
 
 func newModuleWithOptions(
 	maxOutputSizeOpt *base.ConfigOption[int],
 	strictOpt *base.ConfigOption[bool],
+	maxRenderTimeOpt *base.ConfigOption[float64],
 ) *Module {
-	cm, _ := base.NewConfigurableModuleWithConfigOptions(maxOutputSizeOpt, strictOpt)
+	cm, _ := base.NewConfigurableModuleWithConfigOptions(maxOutputSizeOpt, strictOpt, maxRenderTimeOpt)
 	return &Module{cfgMod: cm, ext: cm.Extend()}
 }
 
@@ -91,7 +105,7 @@ func (m *Module) render(thread *starlark.Thread, b *starlark.Builtin, args starl
 	if err != nil {
 		return none, err
 	}
-	out, err := m.renderSource(source, bindings)
+	out, err := m.renderSource(thread, source, bindings)
 	if err != nil {
 		return none, err
 	}
@@ -110,7 +124,7 @@ func (m *Module) parse(thread *starlark.Thread, b *starlark.Builtin, args starla
 	if perr != nil {
 		return none, fmt.Errorf("liquid.parse: %w", perr)
 	}
-	return &templateValue{tmpl: tmpl, maxOutput: m.maxOutput()}, nil
+	return &templateValue{tmpl: tmpl, maxOutput: m.maxOutput(), maxRenderTime: m.maxRenderTime()}, nil
 }
 
 // parseString compiles a template, recovering panics into errors (matching the
@@ -197,34 +211,191 @@ func (m *Module) maxOutput() int {
 	return defaultMaxOutputSize
 }
 
-// renderSource renders source with bindings under the safety policy.
-func (m *Module) renderSource(source string, bindings map[string]interface{}) (string, error) {
-	return renderWith(m.newEngine(), source, bindings, m.maxOutput())
+func (m *Module) maxRenderTime() float64 {
+	return m.ext.GetFloat(configKeyMaxRenderTime, defaultMaxRenderTime)
 }
 
-// renderWith renders with a prepared engine, recovering panics and capping output.
-func renderWith(engine *liquid.Engine, source string, bindings map[string]interface{}, maxOutput int) (out string, err error) {
-	cw := &cappedWriter{limit: maxOutput}
-	defer func() {
-		if r := recover(); r != nil {
-			// The engine panics when a buffered flush fails (render.go's
-			// Flush/TrimLeft), so an output-cap overflow can arrive here rather
-			// than as the ParseAndFRender error below. Normalize it to the
-			// documented errOutputLimit instead of a generic "render panic".
+// renderSource renders source with bindings under the safety policy.
+func (m *Module) renderSource(thread *starlark.Thread, source string, bindings map[string]interface{}) (string, error) {
+	return renderBounded(thread, m.maxRenderTime(), m.maxOutput(), engineRender(m.newEngine(), source, bindings))
+}
+
+// renderWith renders with a prepared engine under the output cap and no time
+// limit. It is a convenience for the one-shot render path used by tests.
+func renderWith(engine *liquid.Engine, source string, bindings map[string]interface{}, maxOutput int) (string, error) {
+	return renderBounded(&starlark.Thread{}, 0, maxOutput, engineRender(engine, source, bindings))
+}
+
+// engineRender returns the render step for renderBounded: parse+render source
+// into the capped writer, normalizing an output-cap overflow to errOutputLimit.
+// The bindings are deep-copied up front (see isolateBindings).
+func engineRender(engine *liquid.Engine, source string, bindings map[string]interface{}) func(*cappedWriter) (string, error) {
+	safe := isolateBindings(bindings)
+	return func(cw *cappedWriter) (string, error) {
+		if serr := engine.ParseAndFRender(cw, []byte(source), liquid.Bindings(safe)); serr != nil {
 			if cw.exceeded {
-				out, err = "", errOutputLimit
-				return
+				return "", errOutputLimit
 			}
-			out, err = "", fmt.Errorf("liquid: render panic: %v", r)
+			return "", fmt.Errorf("liquid: %w", serr)
 		}
-	}()
-	if serr := engine.ParseAndFRender(cw, []byte(source), liquid.Bindings(bindings)); serr != nil {
-		if cw.exceeded {
-			return "", errOutputLimit
-		}
-		return "", fmt.Errorf("liquid: %w", serr)
+		return cw.buf.String(), nil
 	}
-	return cw.buf.String(), nil
+}
+
+// visitKey identifies a map/slice by its header pointer, length, and concrete
+// type, so a shared or cyclic reference is copied once (no aliasing, no
+// exponential blow-up on a cycle) while two different slice views over the same
+// backing array — or two distinct named types that happen to share a pointer and
+// length — stay distinct (avoiding a cross-type Set panic).
+type visitKey struct {
+	ptr    uintptr
+	length int
+	typ    reflect.Type
+}
+
+// isolateBindings returns a copy of the bindings in which every map and slice is
+// deep-copied. renderBounded may leave a render goroutine running after a
+// timeout (osteele/liquid has no cancellation); that goroutine keeps reading the
+// bindings. A map or slice the script passed by reference (dataconv can unwrap a
+// host GoMap/GoSlice by reference) is the dangerous case: the host mutating it
+// concurrently would be a data race, or a fatal concurrent-map access. Copying
+// maps and slices here — synchronously, before the goroutine starts — removes
+// that sharing for the shapes real bindings take (script-built dicts/lists, and
+// host maps/slices).
+//
+// Everything else is shared as-is: scalars and strings are immutable; time.Time
+// and other value types are immutable in practice and cannot be deep-copied
+// through their unexported state anyway; structs, pointers, and closures are not
+// what a template binding normally carries. A host that injects such a mutable
+// value into a script AND mutates it concurrently with a timed-out render is the
+// documented residual — pass immutable data, or rely on the host/sandbox
+// execution deadline for the hard bound.
+func isolateBindings(bindings map[string]interface{}) map[string]interface{} {
+	seen := map[visitKey]interface{}{}
+	out := make(map[string]interface{}, len(bindings))
+	for k, v := range bindings {
+		out[k] = copyBindingValue(v, seen)
+	}
+	return out
+}
+
+// copyBindingValue deep-copies maps and slices (via one reflect path, covering
+// both plain map[string]interface{}/[]interface{} and typed collections),
+// threading the visited set for cycle safety; any other value is shared.
+func copyBindingValue(v interface{}, seen map[visitKey]interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map:
+		return copyReflectMap(rv, seen)
+	case reflect.Slice:
+		return copyReflectSlice(rv, seen)
+	default:
+		return v
+	}
+}
+
+func copyReflectMap(rv reflect.Value, seen map[visitKey]interface{}) interface{} {
+	if rv.IsNil() {
+		return rv.Interface()
+	}
+	key := visitKey{rv.Pointer(), rv.Len(), rv.Type()}
+	if c, ok := seen[key]; ok {
+		return c
+	}
+	out := reflect.MakeMapWithSize(rv.Type(), rv.Len())
+	seen[key] = out.Interface()
+	elemType := rv.Type().Elem()
+	iter := rv.MapRange()
+	for iter.Next() {
+		// Keys are shared (they are almost always immutable scalars/strings).
+		out.SetMapIndex(iter.Key(), asElem(copyBindingValue(iter.Value().Interface(), seen), elemType))
+	}
+	return out.Interface()
+}
+
+func copyReflectSlice(rv reflect.Value, seen map[visitKey]interface{}) interface{} {
+	if rv.IsNil() || rv.Len() == 0 {
+		return rv.Interface()
+	}
+	key := visitKey{rv.Pointer(), rv.Len(), rv.Type()}
+	if c, ok := seen[key]; ok {
+		return c
+	}
+	out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+	seen[key] = out.Interface()
+	elemType := rv.Type().Elem()
+	for i := 0; i < rv.Len(); i++ {
+		out.Index(i).Set(asElem(copyBindingValue(rv.Index(i).Interface(), seen), elemType))
+	}
+	return out.Interface()
+}
+
+// asElem wraps a copied value as a reflect.Value assignable to elemType,
+// substituting a typed zero for a nil interface element (reflect.ValueOf(nil)
+// is the invalid Value and cannot be assigned).
+func asElem(v interface{}, elemType reflect.Type) reflect.Value {
+	if v == nil {
+		return reflect.Zero(elemType)
+	}
+	return reflect.ValueOf(v)
+}
+
+// renderBounded runs a render under the output cap AND a wall-clock deadline
+// (the thread context deadline plus, if positive, the module's max_render_time),
+// recovering panics into errors.
+//
+// osteele/liquid's render is a synchronous call with no context support, so it
+// runs in a goroutine and the deadline unblocks the caller with errRenderTimeout
+// rather than wedging the interpreter on a single builtin call. NOTE: on timeout
+// the render goroutine is abandoned — it stops on its own when it finishes or
+// when its output hits the cap (an output-producing runaway fills the 256 KiB
+// cap almost immediately), but a hard CPU bound for a no-output template
+// (e.g. `{% for i in (1..1e9) %}{% endfor %}`) requires an OS/sandbox limit.
+func renderBounded(thread *starlark.Thread, timeout float64, maxOutput int, do func(cw *cappedWriter) (string, error)) (string, error) {
+	ctx, cancel := util.OpContext(thread, util.DurationFromSeconds(timeout))
+	defer cancel()
+
+	// If the deadline has already passed (e.g. an expired thread context), don't
+	// start work — return the timeout deterministically.
+	if err := ctx.Err(); err != nil {
+		return "", errRenderTimeout
+	}
+
+	type result struct {
+		out string
+		err error
+	}
+	ch := make(chan result, 1) // buffered so an abandoned goroutine never blocks
+	go func() {
+		cw := &cappedWriter{limit: maxOutput}
+		var out string
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// The engine panics when a buffered flush fails, so an
+					// output-cap overflow can surface here. Normalize it.
+					if cw.exceeded {
+						out, err = "", errOutputLimit
+						return
+					}
+					out, err = "", fmt.Errorf("liquid: render panic: %v", r)
+				}
+			}()
+			out, err = do(cw)
+		}()
+		ch <- result{out, err}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.out, res.err
+	case <-ctx.Done():
+		return "", errRenderTimeout
+	}
 }
 
 // cappedWriter accumulates output up to limit bytes, then fails fast.
@@ -240,16 +411,4 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 		return 0, errOutputLimit
 	}
 	return w.buf.Write(p)
-}
-
-func upper(s string) string {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		out[i] = c
-	}
-	return string(out)
 }

@@ -10,8 +10,9 @@ import (
 // templateValue is a compiled Liquid template returned by parse(). It can be
 // rendered repeatedly with different bindings.
 type templateValue struct {
-	tmpl      *liquid.Template
-	maxOutput int
+	tmpl          *liquid.Template
+	maxOutput     int
+	maxRenderTime float64
 }
 
 var (
@@ -51,33 +52,25 @@ func (t *templateValue) render(thread *starlark.Thread, b *starlark.Builtin, arg
 	if err != nil {
 		return none, err
 	}
-	out, err := t.renderTemplate(bindings)
+	out, err := t.renderTemplate(thread, bindings)
 	if err != nil {
 		return none, err
 	}
 	return starlark.String(out), nil
 }
 
-// renderTemplate renders the compiled template, recovering panics and capping output.
-func (t *templateValue) renderTemplate(bindings map[string]interface{}) (out string, err error) {
-	cw := &cappedWriter{limit: t.maxOutput}
-	defer func() {
-		if r := recover(); r != nil {
-			// The engine panics when a buffered flush fails, so an output-cap
-			// overflow can arrive here rather than as the FRender error below.
-			// Normalize it to the documented errOutputLimit (mirrors renderWith).
+// renderTemplate renders the compiled template under the output cap and the
+// wall-clock deadline (see renderBounded), recovering panics into errors.
+func (t *templateValue) renderTemplate(thread *starlark.Thread, bindings map[string]interface{}) (string, error) {
+	// Snapshot the bindings before the (possibly outliving) render goroutine.
+	safe := isolateBindings(bindings)
+	return renderBounded(thread, t.maxRenderTime, t.maxOutput, func(cw *cappedWriter) (string, error) {
+		if serr := t.tmpl.FRender(cw, liquid.Bindings(safe)); serr != nil {
 			if cw.exceeded {
-				out, err = "", errOutputLimit
-				return
+				return "", errOutputLimit
 			}
-			out, err = "", fmt.Errorf("liquid: render panic: %v", r)
+			return "", fmt.Errorf("liquid: %w", serr)
 		}
-	}()
-	if serr := t.tmpl.FRender(cw, liquid.Bindings(bindings)); serr != nil {
-		if cw.exceeded {
-			return "", errOutputLimit
-		}
-		return "", fmt.Errorf("liquid: %w", serr)
-	}
-	return cw.buf.String(), nil
+		return cw.buf.String(), nil
+	})
 }
