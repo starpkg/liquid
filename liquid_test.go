@@ -12,9 +12,12 @@ package liquid
 //   - templateValue surface (type/str repr, unhashable, value protocol, attr/arg errors)
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/1set/starlet"
 	osliquid "github.com/osteele/liquid"
@@ -282,6 +285,7 @@ func TestMaxOutputDefaulting(t *testing.T) {
 	custom := newModuleWithOptions(
 		genConfigOption(configKeyMaxOutputSize, "", 4096),
 		genConfigOption(configKeyStrict, "", false),
+		genConfigOption(configKeyMaxRenderTime, "", defaultMaxRenderTime),
 	)
 	if got := custom.maxOutput(); got != 4096 {
 		t.Errorf("maxOutput() = %d, want 4096", got)
@@ -291,6 +295,7 @@ func TestMaxOutputDefaulting(t *testing.T) {
 	zero := newModuleWithOptions(
 		genConfigOption(configKeyMaxOutputSize, "", 0),
 		genConfigOption(configKeyStrict, "", false),
+		genConfigOption(configKeyMaxRenderTime, "", defaultMaxRenderTime),
 	)
 	if got := zero.maxOutput(); got != defaultMaxOutputSize {
 		t.Errorf("maxOutput() with 0 = %d, want default %d", got, defaultMaxOutputSize)
@@ -437,6 +442,7 @@ out = "[" + render("{{ missing }}") + "]"`
 	strict := newModuleWithOptions(
 		genConfigOption(configKeyMaxOutputSize, "", defaultMaxOutputSize),
 		genConfigOption(configKeyStrict, "", true),
+		genConfigOption(configKeyMaxRenderTime, "", defaultMaxRenderTime),
 	)
 	_, err := runRender(t, strict, `load("liquid","render")
 out = render("{{ missing }}")`)
@@ -569,7 +575,7 @@ func TestRenderRecoversPanic(t *testing.T) {
 	})
 	t.Run("renderTemplate nil template", func(t *testing.T) {
 		tv := &templateValue{tmpl: nil, maxOutput: 1024}
-		out, err := tv.renderTemplate(map[string]interface{}{"x": 1})
+		out, err := tv.renderTemplate(&starlark.Thread{}, map[string]interface{}{"x": 1})
 		if out != "" {
 			t.Errorf("out = %q, want empty", out)
 		}
@@ -649,7 +655,7 @@ func capRenderTemplate(src, val string) (string, error) {
 		return "", err
 	}
 	tv := &templateValue{tmpl: tmpl, maxOutput: 8}
-	return tv.renderTemplate(map[string]interface{}{"a": val})
+	return tv.renderTemplate(&starlark.Thread{}, map[string]interface{}{"a": val})
 }
 
 // --- config options end-to-end (through the module's public render() path) ---
@@ -664,6 +670,7 @@ out = render("[{{ missing }}]")`
 	strict := newModuleWithOptions(
 		genConfigOption(configKeyMaxOutputSize, "", defaultMaxOutputSize),
 		genConfigOption(configKeyStrict, "", true),
+		genConfigOption(configKeyMaxRenderTime, "", defaultMaxRenderTime),
 	)
 	if _, err := runRender(t, strict, script); err == nil ||
 		!strings.Contains(err.Error(), "undefined variable") {
@@ -849,7 +856,7 @@ func TestTemplateRenderTimeError(t *testing.T) {
 		t.Fatalf("parse should succeed (filter resolution is deferred): %v", perr)
 	}
 	tv := &templateValue{tmpl: tmpl, maxOutput: defaultMaxOutputSize}
-	out, err := tv.renderTemplate(map[string]interface{}{"x": 1})
+	out, err := tv.renderTemplate(&starlark.Thread{}, map[string]interface{}{"x": 1})
 	if out != "" {
 		t.Errorf("out = %q, want empty on error", out)
 	}
@@ -863,5 +870,244 @@ tmpl = parse("{{ x | nope }}")
 out = tmpl.render({"x": 1})`)
 	if serr == nil || !strings.Contains(serr.Error(), `undefined filter "nope"`) {
 		t.Errorf("Template.render error = %v, want the undefined-filter error", serr)
+	}
+}
+
+// --- render time bound (STAR-86) ---------------------------------------------
+
+// TestRenderBoundedTimeoutFires verifies renderBounded returns errRenderTimeout
+// promptly when the render step does not finish within max_render_time, instead
+// of wedging the caller. A blocking render step makes this deterministic (no CPU
+// timing), matching the mechanism a runaway template would trip.
+func TestRenderBoundedTimeoutFires(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release) // let the abandoned goroutine finish after the test
+
+	start := time.Now()
+	out, err := renderBounded(&starlark.Thread{}, 0.05, 1024, func(cw *cappedWriter) (string, error) {
+		<-release // stand in for a long / uninterruptible render
+		return "done", nil
+	})
+	if !errors.Is(err, errRenderTimeout) {
+		t.Fatalf("expected errRenderTimeout, got (%q, %v)", out, err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("timeout should fire promptly (~50ms), took %v", elapsed)
+	}
+}
+
+// TestRenderBoundedHonorsThreadDeadline verifies that even with no module-level
+// max_render_time (0), a deadline on the thread context bounds the render — this
+// is how a host/sandbox caps overall execution.
+func TestRenderBoundedHonorsThreadDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	thread := &starlark.Thread{}
+	thread.SetLocal("context", ctx)
+
+	release := make(chan struct{})
+	defer close(release)
+
+	out, err := renderBounded(thread, 0, 1024, func(cw *cappedWriter) (string, error) {
+		<-release
+		return "done", nil
+	})
+	if !errors.Is(err, errRenderTimeout) {
+		t.Fatalf("expected errRenderTimeout from thread deadline, got (%q, %v)", out, err)
+	}
+}
+
+// TestRenderBoundedCompletesUnderDeadline verifies the normal path is unaffected:
+// a fast render returns its output well within the limit.
+func TestRenderBoundedCompletesUnderDeadline(t *testing.T) {
+	out, err := renderWith(osliquid.NewEngine(), "{{ a }}", map[string]interface{}{"a": "hi"}, 1024)
+	if err != nil || out != "hi" {
+		t.Fatalf("fast render = (%q, %v), want (\"hi\", nil)", out, err)
+	}
+}
+
+// TestMaxRenderTimeIsHostOnly verifies the DoS time lever cannot be changed from
+// a script: no set_max_render_time builtin is generated (host-only), while the
+// getter remains, and the value flows through maxRenderTime().
+func TestMaxRenderTimeIsHostOnly(t *testing.T) {
+	t.Setenv("LIQUID_MAX_RENDER_TIME", "1.5")
+	m := NewModule()
+	if got := m.maxRenderTime(); got != 1.5 {
+		t.Errorf("maxRenderTime() = %v, want 1.5 from env", got)
+	}
+
+	dict, err := m.LoadModule()()
+	if err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	mod, ok := dict[ModuleName].(starlark.HasAttrs)
+	if !ok {
+		t.Fatalf("module is not attr-accessible: %T", dict[ModuleName])
+	}
+	attrs := map[string]bool{}
+	for _, n := range mod.AttrNames() {
+		attrs[n] = true
+	}
+	if attrs["set_max_render_time"] {
+		t.Error("set_max_render_time must not be script-settable (host-only DoS lever)")
+	}
+	if !attrs["get_max_render_time"] {
+		t.Error("get_max_render_time should be present")
+	}
+}
+
+// --- binding isolation (STAR-86, deep-copy before the outliving render) -------
+
+// TestIsolateBindings verifies every map and slice in the bindings is deep-copied
+// (plain, typed, nested, and cyclic), so a render that outlives its call (an
+// abandoned goroutine after a timeout) cannot race with host mutation of a
+// by-reference map/slice the script passed in.
+func TestIsolateBindings(t *testing.T) {
+	orig := map[string]interface{}{
+		"nested": map[string]interface{}{"k": "v"},
+		"list":   []interface{}{1, map[string]interface{}{"a": 1}},
+		"typed":  map[string]int{"n": 1}, // a host-backed typed map (by-reference)
+		"tslice": []int{1, 2},            // a typed slice
+	}
+	safe := isolateBindings(orig)
+
+	// Mutating the originals must not touch the copy.
+	orig["nested"].(map[string]interface{})["k"] = "MUT"
+	orig["list"].([]interface{})[1].(map[string]interface{})["a"] = 999
+	orig["typed"].(map[string]int)["n"] = 999
+	orig["tslice"].([]int)[0] = 999
+
+	if got := safe["nested"].(map[string]interface{})["k"]; got != "v" {
+		t.Errorf("nested map not isolated: %v", got)
+	}
+	if got := safe["list"].([]interface{})[1].(map[string]interface{})["a"]; got != 1 {
+		t.Errorf("slice element not isolated: %v", got)
+	}
+	if got := safe["typed"].(map[string]int)["n"]; got != 1 {
+		t.Errorf("typed map not isolated: %v", got)
+	}
+	if got := safe["tslice"].([]int)[0]; got != 1 {
+		t.Errorf("typed slice not isolated: %v", got)
+	}
+
+	// A render through the isolated bindings still produces correct output.
+	out, err := renderWith(osliquid.NewEngine(), "{{ nested.k }}", map[string]interface{}{
+		"nested": map[string]interface{}{"k": "hello"},
+	}, 1024)
+	if err != nil || out != "hello" {
+		t.Fatalf("render through isolation = (%q, %v), want (\"hello\", nil)", out, err)
+	}
+}
+
+// TestIsolateBindingsCycleAndShared covers the visited-set behavior: a cyclic map
+// terminates (copied once) and a slice shared under two keys is copied once.
+func TestIsolateBindingsCycleAndShared(t *testing.T) {
+	t.Run("cyclic map terminates and is independent", func(t *testing.T) {
+		m := map[string]interface{}{"v": 1}
+		m["self"] = m                                              // cycle
+		safe := isolateBindings(map[string]interface{}{"root": m}) // must not hang/OOM
+		m["v"] = 999
+		root := safe["root"].(map[string]interface{})
+		if root["v"] != 1 {
+			t.Errorf("cyclic map not isolated: v=%v", root["v"])
+		}
+		if inner, ok := root["self"].(map[string]interface{}); !ok || inner["v"] != 1 {
+			t.Errorf("cycle not reconstructed independently: %#v", root["self"])
+		}
+	})
+
+	t.Run("slice shared under two keys is copied once", func(t *testing.T) {
+		shared := []interface{}{1, 2}
+		safe := isolateBindings(map[string]interface{}{"a": shared, "b": shared})
+		a := safe["a"].([]interface{})
+		b := safe["b"].([]interface{})
+		if &a[0] != &b[0] {
+			t.Error("shared slice should be de-duplicated to one copy")
+		}
+		if &a[0] == &shared[0] {
+			t.Error("shared slice not copied (still aliases original)")
+		}
+	})
+}
+
+// TestIsolateBindingsSharesImmutable verifies non-map/slice values are shared
+// unchanged — in particular time.Time (which has unexported state a reflect deep
+// copy would zero, breaking date formatting) must pass through intact.
+func TestIsolateBindingsSharesImmutable(t *testing.T) {
+	ts := time.Date(2021, 6, 15, 0, 0, 0, 0, time.UTC)
+	safe := isolateBindings(map[string]interface{}{
+		"t":   ts,
+		"n":   42,
+		"s":   "hi",
+		"nil": nil,
+	})
+	if got := safe["t"].(time.Time); !got.Equal(ts) {
+		t.Errorf("time.Time must be preserved, got %v want %v", got, ts)
+	}
+	if safe["n"] != 42 || safe["s"] != "hi" || safe["nil"] != nil {
+		t.Errorf("scalars/nil not shared faithfully: %v %v %v", safe["n"], safe["s"], safe["nil"])
+	}
+
+	// A real render with a time.Time binding must format the actual date, not a
+	// zeroed value.
+	out, err := renderWith(osliquid.NewEngine(), `{{ t | date: "%Y" }}`, map[string]interface{}{"t": ts}, 1024)
+	if err != nil || out != "2021" {
+		t.Fatalf("date render through isolation = (%q, %v), want (\"2021\", nil)", out, err)
+	}
+}
+
+// TestIsolateBindingsEdgeContainers covers the nil/empty container and nil-element
+// branches of the copier.
+func TestIsolateBindingsEdgeContainers(t *testing.T) {
+	var nilMap map[string]int
+	var nilSlice []int
+	safe := isolateBindings(map[string]interface{}{
+		"nilMap":   nilMap,
+		"nilSlice": nilSlice,
+		"empty":    []interface{}{},
+		"withNil":  []interface{}{nil, 1}, // nil element -> asElem zero branch
+		"mapNil":   map[string]interface{}{"k": nil},
+	})
+	if m, ok := safe["nilMap"].(map[string]int); !ok || m != nil {
+		t.Errorf("nil typed map must stay nil, got %#v", safe["nilMap"])
+	}
+	if s, ok := safe["nilSlice"].([]int); !ok || s != nil {
+		t.Errorf("nil typed slice must stay nil, got %#v", safe["nilSlice"])
+	}
+	if s := safe["empty"].([]interface{}); len(s) != 0 {
+		t.Errorf("empty slice: len %d", len(s))
+	}
+	if s := safe["withNil"].([]interface{}); s[0] != nil || s[1] != 1 {
+		t.Errorf("nil element slice mishandled: %#v", s)
+	}
+	if m := safe["mapNil"].(map[string]interface{}); m["k"] != nil {
+		t.Errorf("nil map value mishandled: %#v", m)
+	}
+}
+
+// namedIntsA and namedIntsB are distinct named slice types used to prove the
+// visited set distinguishes concrete types (not just ptr+len), so two named
+// views over the same backing array don't collide into a cross-type Set panic.
+type namedIntsA []int
+type namedIntsB []int
+
+func TestIsolateBindingsNamedTypeCollision(t *testing.T) {
+	base := []int{1, 2}
+	safe := isolateBindings(map[string]interface{}{
+		"a": namedIntsA(base),
+		"b": namedIntsB(base), // same ptr+len as a, different concrete type
+	})
+	a, okA := safe["a"].(namedIntsA)
+	b, okB := safe["b"].(namedIntsB)
+	if !okA || !okB {
+		t.Fatalf("named-type copies lost their types: %T %T", safe["a"], safe["b"])
+	}
+	if len(a) != 2 || len(b) != 2 {
+		t.Fatalf("named-type copies wrong length: %d %d", len(a), len(b))
+	}
+	// Mutating the shared backing array must not affect either copy.
+	base[0] = 999
+	if a[0] != 1 || b[0] != 1 {
+		t.Errorf("named-type copies not isolated: a=%v b=%v", a, b)
 	}
 }

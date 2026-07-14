@@ -101,11 +101,22 @@ error-message shapes, and examples of every builtin and method above.
 
 ## Configuration
 
-The module's options (`max_output_size`, `strict`) are configured via
-environment variables (`LIQUID_MAX_OUTPUT_SIZE` / `LIQUID_STRICT`) or per-option
-`get_<key>` / `set_<key>` accessor builtins, and bound how every subsequent
-`render` / `parse` call behaves. Rendered output is capped at `max_output_size`
-bytes (256 KiB by default); `strict` turns an undefined variable into an error.
+The module's options (`max_output_size`, `strict`, `max_render_time`) are
+configured via environment variables (`LIQUID_MAX_OUTPUT_SIZE` / `LIQUID_STRICT`
+/ `LIQUID_MAX_RENDER_TIME`) or per-option accessor builtins, and bound how every
+subsequent `render` / `parse` call behaves. Rendered output is capped at
+`max_output_size` bytes (256 KiB by default); `strict` turns an undefined
+variable into an error; `max_render_time` bounds a single render's wall-clock
+time (`0` = no module limit, still bounded by the thread context deadline if the
+host set one). `max_render_time` is **host-only** (no `set_max_render_time`) so a
+script cannot disable the DoS time limit.
+
+Note: a render that exceeds the time limit returns an error to the script, but
+because the underlying engine has no cancellation support the abandoned render
+finishes on its own (an output-producing runaway stops almost immediately at the
+output cap; a pathological no-output loop keeps a goroutine busy until it
+completes). A hard CPU bound requires an OS/sandbox limit at the host layer.
+
 See the [Configuration section of docs/API.md](docs/API.md#configuration) for the
 full option table, defaults, accessors, and safety details.
 
