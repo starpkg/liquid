@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`starpkg/liquid` is an **L4 domain module** of the Star\* ecosystem: it exposes the [Liquid](https://shopify.github.io/liquid/) template language to Starlark scripts. A script loads the module, hands it a template source plus a bindings dict (and/or keyword arguments), and gets back the rendered string.
+`starpkg/liquid` is an **L3 domain module** of the Star\* ecosystem: it exposes the [Liquid](https://shopify.github.io/liquid/) template language to Starlark scripts. A script loads the module, hands it a template source plus a bindings dict (and/or keyword arguments), and gets back the rendered string.
 
 The starpkg layer is **support for necessary local operations + simple abstractions over common online services, for ease of use.** `liquid` sits firmly on the **local** side: it is a pure-Go, offline text-templating primitive — no network, no filesystem reach (the `{% include %}` tag is deliberately disabled). It wraps [`osteele/liquid`](https://github.com/osteele/liquid) v1.4.0, the pure-Go Liquid engine.
 
@@ -68,6 +68,6 @@ Three layers must stay in sync (enforced by the doc standard, `plan/starpkg文�
 ## Release discipline
 
 - **Floor = go 1.19** (this repo's `go.mod`, tracking the `go.starlark.net` baseline `ffb3f39`). A repo's floor only rises in its own isolated pin PR.
-- **CI matrix** = `[1.19.x, 1.25.x]` via the centralized reusable workflow in `1set/meta` (`go-ci.yml`, pinned to a full commit SHA for supply-chain safety; bump the pin when meta's workflow changes).
+- **CI matrix** = `[1.19.x, 1.27.x]` via the centralized reusable workflow in `1set/meta` (`go-ci.yml`, pinned to a full commit SHA for supply-chain safety; bump the pin when meta's workflow changes).
 - **Pin upgrade is the last PR of the series.** Upgrading the `go.starlark.net` / 1set deps / go floor happens as one isolated PR *after* the bug/doc fixes, with the CI floor leg flipped in the same PR. Never tag a release before the pin PR merges.
 - **Bumping the version, the go floor, or tagging are user-confirmed actions** — never tag autonomously; draft the title + notes and tag only after explicit approval; default to patch bumps; a published tag is immutable in the Go module proxy.
